@@ -1,0 +1,605 @@
+"""
+Streamlit demo for SmartSpectra.
+
+Provides a user interface for:
+1. RGB to Hyperspectral reconstruction via fine-tuned MST++ transformers.
+2. Pesticide residue triage using the Model 2 Hybrid XGBoost classifier.
+3. Quality validation via a Routing Gate (CLIP) and confidence thresholding.
+
+The app supports three modes:
+- Upload a photo: Full end-to-end triage of a user-provided image.
+- Compare with real HSI: Evaluation against the Agro-HSR test set.
+- Compare checkpoints: Qualitative analysis of domain adaptation (A vs B vs C).
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import streamlit as st
+import torch
+import joblib
+
+from inference import (
+    DEFAULT_CHECKPOINT,
+    PINNED_DEFAULT_CKPT,
+    TEST_RGB_DIR,
+    TEST_SPEC_DIR,
+    compute_metrics,
+    crop_to_match,
+    cube_fruit_stats,
+    enhance_for_display,
+    list_test_pairs,
+    load_ground_truth_hsi,
+    load_model,
+    resolve_checkpoint_for_pipeline,
+    route_and_infer,
+    run_model1,
+    segment_fruit,
+    load_model2_ultra,
+    predict_pesticide,
+    predict_pesticide_hybrid,
+)
+
+# ---------------------------------------------------------------------
+# Configuration & Thresholds
+# ---------------------------------------------------------------------
+# Empirical p75 MRAE from the 282-scene Agro-HSR test set.
+LOW_CONFIDENCE_MRAE_THRESHOLD = 0.0326
+
+def _confidence_banner(mrae: float) -> None:
+    """
+    Render a high-contrast banner indicating reconstruction reliability.
+
+    Args:
+        mrae: Mean Relative Absolute Error of the reconstructed cube.
+    """
+    if mrae > LOW_CONFIDENCE_MRAE_THRESHOLD:
+        st.error(
+            f"🔴 **LOW CONFIDENCE** — reconstruction MRAE = {mrae:.4f} "
+            f"exceeds the empirical p75 threshold "
+            f"({LOW_CONFIDENCE_MRAE_THRESHOLD:.4f}) from the 282-scene "
+            f"Agro-HSR test set.\n\n"
+            f"**Recommendation:** route this sample to lab-based pesticide "
+            f"testing. The spectral shape in this image is too unusual for "
+            f"the reconstruction to be trustworthy.",
+            icon="⚠️",
+        )
+    else:
+        st.success(
+            f"🟢 **HIGH CONFIDENCE** — reconstruction MRAE = {mrae:.4f} "
+            f"is below the empirical p75 threshold "
+            f"({LOW_CONFIDENCE_MRAE_THRESHOLD:.4f}). Spectral shape is "
+            f"within the expected reconstruction quality for this model.",
+            icon="✅",
+        )
+
+# ---------------------------------------------------------------------
+# Routing Gate UI
+# ---------------------------------------------------------------------
+def _render_routing_decision(decision: Any) -> None:
+    """
+    Render the routing tier badge and associated warning/rejection panels.
+
+    Args:
+        decision: RoutingDecision object returned by route_image.
+    """
+    tier = decision.tier
+    label = decision.detected_label or "unknown"
+    item_name = label.replace("a photo of ", "").strip()
+    conf_pct = decision.confidence * 100
+
+    if tier == 3:
+        st.error(
+            f"### ✗ Not a produce photo\n\n"
+            f"This image was classified as **{item_name}** "
+            f"(confidence {conf_pct:.1f}%), not as a fruit or vegetable. "
+            f"SmartSpectra can only analyse apple and sweet-potato photos, "
+            f"so no analysis has been run.\n\n"
+            f"**Please upload a clear, close-up photo of an apple or a "
+            f"sweet potato.**"
+        )
+        return
+
+    if tier == 2:
+        st.warning(
+            f"### ⚠ Unknown produce type detected\n\n"
+            f"This image was classified as **{item_name}** "
+            f"(confidence {conf_pct:.1f}%), not as an apple or sweet "
+            f"potato. SmartSpectra was trained specifically on apple and "
+            f"sweet-potato photos, so its output for other produce is "
+            f"**experimental**.\n\n"
+            f"The analysis has been run in the background, but the "
+            f"results are hidden below for safety. Tick "
+            f"'Show result anyway' if you want to see them anyway."
+        )
+        return
+
+    # Tier 1
+    pipeline_name = {
+        "A": "sweet-potato quality pipeline",
+        "C": "apple quality pipeline",
+    }.get(decision.pipeline_to_run or "", "matching quality pipeline")
+    st.success(
+        f"### ✓ Detected: {item_name}\n\n"
+        f"Routed to the **{pipeline_name}** "
+        f"(confidence {conf_pct:.1f}%)."
+    )
+
+def _tier2_show_anyway_toggle() -> bool:
+    """
+    Render the safety checkbox for Tier 2 outputs.
+
+    Returns:
+        True if the user opted in to see the experimental result.
+    """
+    return st.checkbox(
+        "Show result anyway (low-confidence / experimental)",
+        value=False,
+        key="tier2_show_anyway",
+        help=(
+            "Tick this to reveal the pipeline's analysis of an unknown "
+            "produce type. The output is experimental and should not be "
+            "used for real decisions."
+        ),
+    )
+
+# ---------------------------------------------------------------------
+# Page configuration
+# ---------------------------------------------------------------------
+st.set_page_config(
+    page_title="SmartSpectra — Model 1 Demo",
+    layout="wide",
+)
+st.title("SmartSpectra — RGB to Hyperspectral Reconstruction")
+st.caption(
+    "Model 1 (fine-tuned MST++) — reconstructs a **31-band** "
+    "hyperspectral cube (**400–1000 nm**) from a single RGB photo. "
+    "Output is a *reconstruction estimate*, not a measured spectrum."
+)
+st.info(
+    "**Checkpoint in use:** `run_trained/net_best.pth` — a fine-tuned "
+    "MST++ on the Agro-HSR dataset. See `models/checkpoints/run_trained/PROVENANCE.md` "
+    "for detailed training logs and MRAE metrics."
+)
+
+@st.cache_resource(show_spinner="Loading fine-tuned MST++ weights…")
+def get_model(ckpt_path: str) -> Tuple[torch.nn.Module, torch.device]:
+    """Build the model on the right device and cache it for the session."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, device = load_model(ckpt_path, device)
+    return model, device
+
+@st.cache_resource(show_spinner="Loading Model 2 Hybrid weights…")
+def get_model2_hybrid() -> Any:
+    """Load and cache the Model 2 Hybrid (XGBoost + Scaler)."""
+    ckpt_path = Path(__file__).resolve().parent.parent / "models" / "checkpoints" / "model2_hybrid.pkl"
+    if not ckpt_path.is_file():
+        ckpt_path = Path(__file__).resolve().parent.parent / "models" / "checkpoints" / "model2_ultra.pkl"
+    return joblib.load(str(ckpt_path))
+
+def _render_pesticide_prediction(probs: Dict[str, float], label: str, confidence: float) -> None:
+    """
+    Render the Model 2 Hybrid prediction.
+    Displays all probabilities, then finalizes if top confidence > 50%.
+    """
+    st.markdown("#### 📊 Triage Probability Distribution")
+
+    cols = st.columns(3)
+    for i, (cat, prob) in enumerate(probs.items()):
+        cols[i].metric(cat, f"{prob:.1%}")
+
+    st.divider()
+
+    if confidence <= 0.50:
+        st.warning(
+            f"### ⚠ No Definitive Result\n\n"
+            f"The model is uncertain (highest confidence: {confidence:.1%}). "
+            f"The most likely category was **{label}**, but it did not meet the "
+            f"50% threshold for finalization."
+        )
+        return
+
+    color_map = {
+        "Fresh": ("🟢", "success"),
+        "Fungicide": ("🟠", "warning"),
+        "Insecticide": ("🔴", "error"),
+    }
+    icon, st_func = color_map.get(label, ("⚪", "info"))
+
+    st.markdown(f"### {icon} Finalized Triage Result")
+    if st_func == "success":
+        st.success(f"**Result:** {label} (Confidence: {confidence:.1%})")
+    elif st_func == "warning":
+        st.warning(f"**Result:** {label} (Confidence: {confidence:.1%})")
+    elif st_func == "error":
+        st.error(f"**Result:** {label} (Confidence: {confidence:.1%})")
+    else:
+        st.info(f"**Result:** {label} (Confidence: {confidence:.1%})")
+
+    st.caption(
+        "Prediction based on **Model 2 Hybrid (XGBoost)**. "
+        "This model analyzes the reconstructed spectral shape to triage residues."
+    )
+
+# ---------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------
+with st.sidebar.expander("📊 Why this matters (Model 2 results)", expanded=False):
+    st.markdown(
+        "**Honest 5-track comparison on the Puvi Lakshmi apple-pesticide "
+        "dataset.** Original Deployment B 0.5417 was found to be "
+        "**leakage-affected** and is no longer used for "
+        "headline comparison. See `reports/SmartSpectra_Final_Report.md` "
+        "§6.7 for the disclosure.\n"
+        "\n"
+        "The leakage-free **Deployment B'** reads 0.6667 — but the classifier "
+        "degenerates: all fungicide cubes are predicted as fresh.\n"
+        "\n"
+        "| Track | Mean Acc | Fungicide Recall | Notes |\n"
+        "|---|---|---|---|\n"
+        "| **Deployment B'** | **0.6667** | **0.000** | Classifier degenerates to 2-way |\n"
+        "| Ceiling (real HSI) | 0.5000 | 0.500 | n=24, 4-fold CV |\n"
+        "| Deployment A | 0.4583 | 0.125 | n=24, 4-fold CV |\n"
+        "| Baseline | 0.4167 | 0.75 | n=24, 4-fold CV |\n"
+        "| **Deployment C** | **0.4167** | **0.25** | See §11.7 |\n"
+        "| Chance | 0.3333 | 0.33 | — |\n"
+        "\n"
+        "**Honest headline:** all five tracks cluster within noise (std=0.07–0.19). "
+        "The bottleneck is visible-band pesticide discrimination with 8 cubes/class."
+    )
+
+st.sidebar.header("Runtime")
+device_label = "CUDA (GPU)" if torch.cuda.is_available() else "CPU"
+st.sidebar.write(f"**Device:** {device_label}")
+
+ckpt_path = st.sidebar.text_input(
+    "Checkpoint path",
+    value=str(PINNED_DEFAULT_CKPT),
+    help="Path to the fine-tuned .pth. Defaults to `run_trained/net_best.pth`."
+)
+st.sidebar.caption(f"Default: `{PINNED_DEFAULT_CKPT}`")
+
+try:
+    model, device = get_model(ckpt_path)
+    st.sidebar.write(f"**Loaded:** `{os.path.basename(ckpt_path)}`")
+except Exception as e:
+    st.sidebar.error(f"Could not load checkpoint: {e}")
+    st.stop()
+
+mode = st.sidebar.radio(
+    "Mode",
+    options=[
+        "Upload a photo",
+        "Compare with real HSI (test set)",
+        "Compare checkpoints (A vs B vs C)",
+    ],
+)
+
+# ---------------------------------------------------------------------
+# Comparison Views
+# ---------------------------------------------------------------------
+def _render_test_set_comparison(model: torch.nn.Module, device: torch.device) -> None:
+    """Render the Agro-HSR test-set comparison UI."""
+    pairs = list_test_pairs()
+    if not pairs:
+        st.error("No Agro-HSR test pairs found. Check the project layout.")
+        return
+
+    stem = st.selectbox("Pick a test image", options=pairs, index=0)
+
+    if not st.button(f"Run on {stem}", type="primary"):
+        st.caption("👆 Press the button to run the model and compare.")
+        return
+
+    try:
+        gt = load_ground_truth_hsi(stem)
+    except Exception as e:
+        st.error(f"Could not load ground truth: {e}")
+        return
+
+    rgb_path = TEST_RGB_DIR / f"{stem}.jpg"
+    if not rgb_path.is_file():
+        st.error(f"Missing input photo: {rgb_path}")
+        return
+
+    with st.spinner(f"Reconstructing HSI cube for {stem}…"):
+        try:
+            pred = run_model1(rgb_path, model, device)
+        except Exception as e:
+            st.error(f"Inference failed: {e}")
+            return
+
+    gt_aligned = crop_to_match(pred, gt)
+    h, w, b = pred.shape
+    st.success(f"✅ **{stem}** — predicted cube **{h}×{w}×{b}**")
+
+    col_in, col_metrics = st.columns([1, 2])
+    with col_in:
+        st.image(str(rgb_path), caption=f"Input RGB ({stem}.jpg)", use_container_width=True)
+
+    with col_metrics:
+        m = compute_metrics(pred, gt_aligned)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("MRAE", f"{m['mrae']:.4f}")
+        m2.metric("RMSE", f"{m['rmse']:.4f}")
+        m3.metric("PSNR", f"{m['psnr']:.2f} dB")
+
+    _confidence_banner(m["mrae"])
+
+    pred_disp = enhance_for_display(pred)
+    gt_disp = enhance_for_display(gt_aligned)
+
+    st.subheader("Reconstructed vs. real HSI — band slices")
+    band_wavelengths = [450, 550, 700, 850]
+    fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+    for col_i, wl in enumerate(band_wavelengths):
+        b_idx = int(round((wl - 400) / 20))
+        b_idx = max(0, min(30, b_idx))
+        axes[0, col_i].imshow(pred_disp[:, :, b_idx], cmap="gray", vmin=0, vmax=1)
+        axes[0, col_i].set_title(f"Predicted — ~{400 + b_idx * 20} nm")
+        axes[0, col_i].axis("off")
+        axes[1, col_i].imshow(gt_disp[:, :, b_idx], cmap="gray", vmin=0, vmax=1)
+        axes[1, col_i].set_title(f"Real — ~{400 + b_idx * 20} nm")
+        axes[1, col_i].axis("off")
+    fig.suptitle(f"{stem} — top: predicted, bottom: real", fontsize=14)
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.subheader("Spectral signature at the centre pixel")
+    fig2, ax2 = plt.subplots(figsize=(8, 4))
+    wavelengths = np.linspace(400, 1000, pred.shape[2])
+    cy, cx = pred.shape[0] // 2, pred.shape[1] // 2
+    ax2.plot(wavelengths, pred[cy, cx, :], marker="o", markersize=3, label="Predicted")
+    ax2.plot(wavelengths, gt_aligned[cy, cx, :], marker="s", markersize=3, label="Real")
+    ax2.set_xlabel("Wavelength (nm)")
+    ax2.set_ylabel("Reflectance")
+    ax2.set_title(f"Centre pixel ({cy}, {cx})")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="best")
+    fig2.tight_layout()
+    st.pyplot(fig2)
+    plt.close(fig2)
+
+def _apple_pixel_mask(rgb_u8: np.ndarray) -> np.ndarray:
+    """Simple color-segmentation mask for red apples."""
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    V = np.max(rgb, axis=-1)
+    S = (V - np.min(rgb, axis=-1)) / (V + 1e-6)
+    is_red = (R > G + 0.06) & (R > B + 0.10) & (R > 0.30)
+    is_saturated = S > 0.25
+    is_bright = V > 0.25
+    return is_red & is_saturated & is_bright
+
+def _render_triple_checkpoint(
+    model_a: torch.nn.Module,
+    model_b: torch.nn.Module,
+    model_c: Optional[torch.nn.Module],
+    device: torch.device,
+) -> None:
+    """Side-by-side reconstruction comparison of three checkpoints."""
+    uploaded = st.file_uploader("Upload an apple photo", type=["jpg", "jpeg", "png"], key="triple_upload")
+    if not uploaded:
+        st.write("⬆️ Upload an apple photo to compare the checkpoints.")
+        return
+
+    suffix = os.path.splitext(uploaded.name)[1] or ".jpg"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        tmp.write(uploaded.getbuffer())
+        temp_path = tmp.name
+    finally:
+        tmp.close()
+
+    try:
+        from PIL import Image as PILImage
+        pil = PILImage.open(temp_path).convert("RGB")
+        rgb_u8 = np.array(pil, dtype=np.uint8)
+        rgb_f = rgb_u8.astype(np.float32)
+        rgb_minmax = (rgb_f - rgb_f.min()) / (rgb_f.max() - rgb_f.min() + 1e-8)
+        rgb_t = torch.from_numpy(rgb_minmax).permute(2, 0, 1).unsqueeze(0).to(device)
+
+        mask = _apple_pixel_mask(rgb_u8)
+        pct = float(mask.mean() * 100)
+
+        col_in, col_meta = st.columns([1, 2])
+        with col_in:
+            st.image(rgb_u8, caption="Input", use_container_width=True)
+        with col_meta:
+            st.write(f"**Apple-pixel fraction:** {pct:.1f}%")
+
+        def _run(model: torch.nn.Module) -> np.ndarray:
+            with torch.no_grad():
+                cube_t = model(rgb_t).squeeze(0).cpu().numpy()
+            return cube_t.transpose(1, 2, 0).astype(np.float32)
+
+        with st.spinner("Processing checkpoints…"):
+            cube_a = _run(model_a)
+            cube_b = _run(model_b)
+            cube_c = _run(model_c) if model_c is not None else None
+
+        wavelengths = np.linspace(400, 1000, 31)
+        panels = [(cube_a, "A — sweet-potato"), (cube_b, "B — Puvi-Lakshmi apple")]
+        if cube_c is not None:
+            panels.append((cube_c, "C — SpectroFood apple"))
+
+        fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 5))
+        if len(panels) == 1: axes = [axes]
+        for ax_i, (cube, label) in enumerate(panels):
+            ax = axes[ax_i]
+            ax.plot(wavelengths, cube.mean(axis=(0, 1)), marker="o", markersize=3, label="Whole image")
+            if mask.any():
+                ax.plot(wavelengths, cube[mask].mean(axis=0), marker="s", markersize=3, label="Apple pixels", color="#d62728")
+            ax.axvline(700, color="gray", linestyle="--", alpha=0.4)
+            ax.set_xlabel("Wavelength (nm)")
+            ax.set_ylabel("Reflectance")
+            ax.set_title(label)
+            ax.set_ylim(-0.05, 1.05)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best", fontsize=9)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        # Overlay plot
+        fig_o, ax_o = plt.subplots(figsize=(9, 5))
+        colors = {"A — sweet-potato": "#1f77b4", "B — Puvi-Lakshmi apple": "#2ca02c", "C — SpectroFood apple": "#d62728"}
+        for cube, label in panels:
+            if mask.any():
+                ax_o.plot(wavelengths, cube[mask].mean(axis=0), marker="s", markersize=3, label=label, color=colors.get(label, "gray"))
+        ax_o.axvline(700, color="gray", linestyle="--", alpha=0.4)
+        ax_o.set_xlabel("Wavelength (nm)")
+        ax_o.set_ylabel("Reflectance (apple pixels)")
+        ax_o.set_title(f"Masked-spectra overlay (mask = {pct:.1f}%)")
+        ax_o.set_ylim(-0.05, 1.05)
+        ax_o.grid(True, alpha=0.3)
+        ax_o.legend(loc="best", fontsize=10)
+        fig_o.tight_layout()
+        st.pyplot(fig_o)
+        plt.close(fig_o)
+
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------------
+# Main Upload & Inference Flow
+# ---------------------------------------------------------------------
+if mode == "Upload a photo":
+    uploaded = st.file_uploader("Upload a fruit photo", type=["jpg", "jpeg", "png"])
+    if not uploaded:
+        st.write("⬆️ Upload a photo above to see the reconstructed hyperspectral output.")
+        st.markdown("**Tips:**\n- A clear, well-lit photo on a plain background works best.\n- The first run may take a few seconds to load weights.")
+        st.stop()
+
+    suffix = os.path.splitext(uploaded.name)[1] or ".jpg"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        tmp.write(uploaded.getbuffer())
+        temp_path = tmp.name
+    finally:
+        tmp.close()
+
+    try:
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(temp_path).convert("RGB")
+        rgb_u8 = np.array(pil_img, dtype=np.uint8)
+
+        col_input, col_meta = st.columns([1, 2])
+        with col_input:
+            st.image(rgb_u8, caption="Input RGB", use_container_width=True)
+
+        with col_meta:
+            with st.spinner("Classifying image (apple / sweet potato / other)…"):
+                from routing import route_image_from_array
+                decision = route_image_from_array(rgb_u8)
+
+        if decision is not None:
+            _render_routing_decision(decision)
+
+        if decision is None or decision.tier == 3 or decision.pipeline_to_run is None:
+            if decision is not None and decision.tier == 3:
+                st.stop()
+            st.stop()
+
+        show_anyway = True
+        if decision.tier == 2:
+            show_anyway = _tier2_show_anyway_toggle()
+            if not show_anyway:
+                st.caption("Pipeline result is hidden. Tick the box above to reveal it.")
+                st.stop()
+
+        if show_anyway:
+            try:
+                with st.spinner("Reconstructing HSI cube…"):
+                    ckpt_path = resolve_checkpoint_for_pipeline(decision.pipeline_to_run)
+                    model, device = get_model(str(ckpt_path))
+                    cube = run_model1(rgb_u8, model, device)
+            except Exception as e:
+                st.error(f"Inference failed: {e}")
+                st.stop()
+
+            if cube is not None:
+                h, w, b = cube.shape
+                st.success(f"✅ Reconstructed cube: **{h}×{w}×{b}**")
+
+                try:
+                    with st.spinner("Triage residue via Model 2 Hybrid…"):
+                        mask = segment_fruit(rgb_u8)
+                        m2_hybrid = get_model2_hybrid()
+                        probs, label, conf = predict_pesticide_hybrid(cube, rgb_u8, m2_hybrid)
+                        _render_pesticide_prediction(probs, label, conf)
+                except Exception as e:
+                    st.error(f"Model 2 Hybrid prediction failed: {e}")
+
+                with st.expander(f"🍎 Background segmentation", expanded=False):
+                    pct_fruit = float(mask.mean() * 100)
+                    overlay = rgb_u8.copy()
+                    if mask.any():
+                        overlay[~mask] = (overlay[~mask] * 0.30).astype(np.uint8)
+                    else:
+                        overlay[:4, :] = [255, 0, 0]
+                    col_o, col_c = st.columns(2)
+                    col_o.image(rgb_u8, caption="Raw input", use_container_width=True)
+                    col_c.image(overlay, caption=f"After red-fruit mask ({pct_fruit:.1f}% kept)", use_container_width=True)
+
+                stats_fruit = cube_fruit_stats(cube, mask)
+                if stats_fruit["empty"] or stats_fruit["mean"] < 0.0001 or stats_fruit["max"] < 0.1:
+                    st.error("🔴 **LOW CONFIDENCE** — spectral stats are outside typical range.", icon="⚠️")
+                else:
+                    st.success("🟢 **HIGH CONFIDENCE** — masked-cube stats are in typical range.", icon="✅")
+
+                cube_disp = enhance_for_display(cube)
+                st.subheader("Reconstructed spectral bands (sample slices)")
+                band_indices = [0, 7, 15, 23, 30]
+                band_cols = st.columns(len(band_indices))
+                for col, b_idx in zip(band_cols, band_indices):
+                    wavelength = 400 + b_idx * (600 / 30)
+                    col.image(cube_disp[:, :, b_idx], caption=f"~{wavelength:.0f} nm (band {b_idx})", use_container_width=True, clamp=True)
+
+                st.subheader("Spectral signature at the centre pixel")
+                fig, ax = plt.subplots(figsize=(8, 4))
+                wavelengths = np.linspace(400, 1000, cube_disp.shape[2])
+                cy, cx = cube_disp.shape[0] // 2, cube_disp.shape[1] // 2
+                ax.plot(wavelengths, cube_disp[cy, cx, :], marker="o", markersize=3, label=f"pixel ({cy}, {cx})")
+                ax.set_xlabel("Wavelength (nm)")
+                ax.set_ylabel("Relative intensity (stretched, 0–1)")
+                ax.set_title("Reconstructed spectral signature (centre pixel)")
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc="best")
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+elif mode == "Compare with real HSI (test set)":
+    _render_test_set_comparison(model, device)
+elif mode == "Compare checkpoints (A vs B vs C)":
+    try:
+        model_b, _ = get_model(str(APPLE_DEMO_CKPT_B))
+    except Exception as e:
+        st.sidebar.error(f"Could not load apple-finetuned checkpoint B: {e}")
+        st.stop()
+    model_c = None
+    if APPLE_DEMO_CKPT_C.is_file():
+        try:
+            model_c, _ = get_model(str(APPLE_DEMO_CKPT_C))
+        except Exception as e:
+            st.sidebar.warning(f"SpectroFood checkpoint C failed to load ({e}).")
+            model_c = None
+    _render_triple_checkpoint(model, model_b, model_c, device)

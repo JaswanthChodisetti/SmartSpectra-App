@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "created": "2026-08-28",
+  "source_dataset": "data/pesticides/vaishnavi_2023/rgb/",
+  "n_cubes": 28,
+  "gate_model": "open_clip ViT-B-32 (laion2b_s34b_b79k)",
+  "feature_dim": 512,
+  "loo_min_cosine": 0.8110189437866211,
+  "loo_max_cosine": 0.9378637075424194,
+  "loo_mean_cosine": 0.8877330741712025,
+  "intended_threshold": 0.7,
+  "rationale": "LOO apple-to-centroid cosines are in [0.8110, 0.9379]. Non-apple references (4 synthetic Tier-3 images) score \u2264 0.57. Threshold 0.70 separates them with ~0.11 headroom on each side. Used as Tier-1.5 tie-breaker in demo/routing.py:route_image() when best Tier-1 and best Tier-2 CLIP prompts are within tie_margin=0.03 cosine."
+}

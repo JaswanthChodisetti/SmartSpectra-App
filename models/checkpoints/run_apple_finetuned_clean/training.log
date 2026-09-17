@@ -1,0 +1,38 @@
+{
+  "epochs": 5,
+  "init_lr": 3e-05,
+  "batch": 4,
+  "crop": 128,
+  "stride": 64,
+  "device": "cuda",
+  "data_root": "/mnt/c/Users/jaswa/ollama/Smart_spectra/data/pesticides/vaishnavi_2023/apple_pairs_ft",
+  "training_data": "Vaishnavi apple (18 cubes, 2-per-class held out for eval)",
+  "best_loss": 0.04696138103197261,
+  "log": [
+    {
+      "epoch": 1,
+      "loss": 0.13047494702949758,
+      "secs": 12.774263143539429
+    },
+    {
+      "epoch": 2,
+      "loss": 0.08320949690007581,
+      "secs": 10.156515836715698
+    },
+    {
+      "epoch": 3,
+      "loss": 0.06466079984859723,
+      "secs": 10.913818597793579
+    },
+    {
+      "epoch": 4,
+      "loss": 0.05428820966583926,
+      "secs": 11.037845849990845
+    },
+    {
+      "epoch": 5,
+      "loss": 0.04696138103197261,
+      "secs": 11.221824169158936
+    }
+  ]
+}

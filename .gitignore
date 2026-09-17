@@ -1,0 +1,17 @@
+# Data and Backups (Too large for GitHub)
+data/
+Archive/
+Smart_Spectra_Backup/
+*.zip
+*.tar.gz
+
+# Virtual Environments
+venv/
+.venv/
+pdf_venv/
+pptx_venv/
+
+# OS and Cache
+__pycache__/
+.DS_Store
+*.tmp

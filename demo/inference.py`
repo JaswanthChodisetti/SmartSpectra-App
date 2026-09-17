@@ -1,0 +1,617 @@
+"""
+Model 1 inference wrapper for the SmartSpectra Streamlit demo.
+
+This module handles the loading of fine-tuned MST++ checkpoints and the reconstruction
+of 31-band hyperspectral cubes (400-1000 nm) from RGB fruit photos. It also provides
+the core spectral processing tools (SNV, SG-Derivative, Ratios) used by Model 2.
+
+Technical Note:
+Reconstruction uses per-image min-max normalization to match the training dataset
+distribution. Standard 0-255 normalization is avoided as it produces near-zero outputs.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import cv2
+import joblib
+import numpy as np
+import torch
+import torch.nn as nn
+from scipy.signal import savgol_filter
+
+# ---------------------------------------------------------------------
+# Path Setup & Architecture Resolution
+# ---------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+ARCH_DIR = (
+    PROJECT_DIR
+    / "code"
+    / "MST-plus-plus"
+    / "train_code"
+    / "architecture"
+)
+
+def _disable_cuda_on_tensor() -> None:
+    """Replace `torch.Tensor.cuda` with a no-op to support CPU-only environments.
+
+    `architecture/__init__.py`'s `model_generator()` calls `.cuda()` on model
+    classes. We instantiate MST_Plus_Plus directly, but this patch is defensive
+    to prevent crashes on CPU-only machines if refactored.
+    """
+    def _safe_cuda(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        return self
+
+    torch.Tensor.cuda = _safe_cuda
+
+_disable_cuda_on_tensor()
+
+if str(ARCH_DIR) not in sys.path:
+    sys.path.insert(0, str(ARCH_DIR))
+
+# Import MST++ Architecture
+from MST_Plus_Plus import MST_Plus_Plus  # noqa: E402
+
+# ---------------------------------------------------------------------
+# Checkpoint Management
+# ---------------------------------------------------------------------
+CHECKPOINTS_ROOT = PROJECT_DIR / "models" / "checkpoints"
+PINNED_DEFAULT_CKPT = CHECKPOINTS_ROOT / "run_trained" / "net_best.pth"
+
+def _latest_net_best(root: Path) -> Optional[Path]:
+    """Return the most-recently-modified `net_best.pth` under the given root."""
+    if not root.is_dir():
+        return None
+    for pattern in ("net_best.pth", "net_*epoch.pth"):
+        candidates = sorted(
+            (p for p in root.rglob(pattern)
+             if not p.parts[len(root.parts):]
+                  or "run_dummy" not in Path(*p.parts[len(root.parts):]).parts),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    return None
+
+def _resolve_default_checkpoint() -> Path:
+    """Resolve the default checkpoint via environment variable or filesystem."""
+    env = os.environ.get("SMARTSPECTRA_CKPT", "").strip()
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return p
+        raise FileNotFoundError(f"SMARTSPECTRA_CKPT={env!r} does not point to an existing file.")
+
+    if PINNED_DEFAULT_CKPT.is_file():
+        return PINNED_DEFAULT_CKPT
+
+    found = _latest_net_best(CHECKPOINTS_ROOT)
+    if found is not None:
+        return found
+    raise FileNotFoundError("No usable checkpoint found in models/checkpoints.")
+
+def default_checkpoint_path() -> Path:
+    """Public hook to fetch the currently active default checkpoint."""
+    return _resolve_default_checkpoint()
+
+class _LazyCheckpointPath:
+    """Path-like wrapper that resolves the default checkpoint on first access."""
+    def __str__(self) -> str:
+        return str(_resolve_default_checkpoint())
+    def __fspath__(self) -> str:
+        return str(self)
+    def __repr__(self) -> str:
+        return repr(str(self))
+    def __path__(self) -> Path:
+        return _resolve_default_checkpoint()
+
+DEFAULT_CHECKPOINT = _LazyCheckpointPath()
+
+def _load_state_dict_flexible(path: Path) -> Dict[str, torch.Tensor]:
+    """Extract a state_dict from a .pth file, handling various wrapper formats."""
+    obj = torch.load(str(path), map_location="cpu", weights_only=False)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Unexpected checkpoint type {type(obj).__name__} at {path}")
+
+    if obj and all(isinstance(v, torch.Tensor) for v in obj.values()):
+        return obj
+
+    for key in ("state_dict", "model", "model_state_dict", "net"):
+        if key in obj and isinstance(obj[key], dict):
+            return obj[key]
+
+    tensor_keys = [k for k, v in obj.items() if isinstance(v, torch.Tensor)]
+    if tensor_keys:
+        return {k: obj[k] for k in tensor_keys}
+
+    raise ValueError(f"Could not find a valid state_dict in checkpoint at {path}.")
+
+def load_model(
+    checkpoint_path: Union[str, Path, None] = None,
+    device: Union[str, torch.device, None] = None,
+) -> Tuple[nn.Module, torch.device]:
+    """
+    Build the MST_Plus_Plus model and load fine-tuned weights.
+
+    Args:
+        checkpoint_path: Path to the .pth file. If None, uses DEFAULT_CHECKPOINT.
+        device: Target device ('cuda', 'cpu', or torch.device).
+
+    Returns:
+        A tuple of (initialized model, active device).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    model = MST_Plus_Plus()
+
+    if checkpoint_path is None:
+        checkpoint_path = DEFAULT_CHECKPOINT
+    ckpt_p = Path(checkpoint_path)
+
+    if not ckpt_p.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_p}.")
+
+    sd = _load_state_dict_flexible(ckpt_p)
+    sd = {(k[7:] if k.startswith("module.") else k): v for k, v in sd.items()}
+
+    try:
+        model.load_state_dict(sd, strict=True)
+    except RuntimeError:
+        model.load_state_dict(sd, strict=False)
+
+    model.to(device)
+    model.eval()
+    return model, device
+
+# ---------------------------------------------------------------------
+# Preprocessing
+# ---------------------------------------------------------------------
+def preprocess_image(image_path: Union[str, Path]) -> np.ndarray:
+    """
+    Load and normalize an RGB photo for Model 1.
+
+    Args:
+        image_path: Path to the image file.
+    Returns:
+        Normalized tensor as numpy array (1, 3, H, W).
+    """
+    bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Could not read image at {image_path}.")
+    return preprocess_image_from_array(bgr, is_bgr=True)
+
+def preprocess_image_from_array(img_arr: np.ndarray, is_bgr: bool = True) -> np.ndarray:
+    """
+    Apply per-image min-max normalization matching the training dataset.
+
+    Args:
+        img_arr: Input numpy array (H, W, 3).
+        is_bgr: Whether input is in BGR format (OpenCV default).
+    Returns:
+        Normalized float32 array (1, 3, H, W).
+    """
+    arr = img_arr.astype(np.float32)
+    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    if is_bgr:
+        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+
+    rgb = np.transpose(arr, [2, 0, 1])
+    rgb = np.expand_dims(rgb, axis=0)
+    return rgb.astype(np.float32)
+
+def run_model1(
+    image_input: Union[str, Path, np.ndarray],
+    model: nn.Module,
+    device: Union[torch.device, str, None] = None,
+) -> np.ndarray:
+    """
+    Run MST++ reconstruction on a single RGB input.
+
+    Args:
+        image_input: File path or numpy array (H, W, 3).
+        model: The MST++ model in eval mode.
+        device: Device to perform inference on.
+    Returns:
+        Reconstructed HSI cube as numpy array (H, W, 31).
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    if isinstance(image_input, (str, Path)):
+        arr = preprocess_image(image_input)
+    else:
+        arr = preprocess_image_from_array(image_input, is_bgr=False)
+
+    x = torch.from_numpy(arr).to(device)
+
+    with torch.no_grad():
+        y = model(x)
+
+    cube = y.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
+    return cube
+
+def enhance_for_display(
+    cube: np.ndarray,
+    percentile_lo: float = 1.0,
+    percentile_hi: float = 99.0,
+) -> np.ndarray:
+    """Stretch a raw cube's contrast for visualization purposes."""
+    lo = np.percentile(cube, percentile_lo)
+    hi = np.percentile(cube, percentile_hi)
+    stretched = (cube - lo) / (hi - lo + 1e-8)
+    return np.clip(stretched, 0.0, 1.0).astype(np.float32)
+
+def compute_spectral_ratios(mean_spec: np.ndarray) -> np.ndarray:
+    """
+    Compute strategic spectral ratios to highlight chemical residue signatures.
+
+    Args:
+        mean_spec: 31-band mean spectrum.
+    Returns:
+        A 7-dimensional vector of lighting-invariant ratios.
+    """
+    spec = mean_spec + 1e-8
+    ratios = [
+        spec[30] / spec[0],   # Overall spectral slope (NIR / Blue)
+        spec[15] / spec[0],   # Visible slope (Red / Blue)
+        spec[30] / spec[15],  # NIR slope (NIR / Red)
+        (spec[30] - spec[15]) / (spec[30] + spec[15]), # NDVI-like index
+        spec[20] / spec[10],  # Middle NIR / Middle Visible
+        spec[25] / spec[5],   # Deep NIR / Deep Blue
+        spec[30] / spec[20],  # Deep NIR / Mid NIR
+    ]
+    return np.array(ratios, dtype=np.float32)
+
+def segment_produce(
+    rgb_u8: np.ndarray,
+    min_saturation: float = 0.15,
+    min_value: float = 0.15,
+    max_value: float = 0.95,
+) -> np.ndarray:
+    """
+    General produce mask to remove neutral backgrounds.
+
+    Args:
+        rgb_u8: Input image as uint8 (H, W, 3).
+    Returns:
+        Boolean mask (H, W).
+    """
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    V = np.max(rgb, axis=-1)
+    Min = np.min(rgb, axis=-1)
+    S = (V - Min) / (V + 1e-6)
+    return (S > min_saturation) & (V > min_value) & (V < max_value)
+
+def segment_fruit(
+    rgb_u8: np.ndarray,
+    *,
+    red_margin_g: float = 0.06,
+    red_margin_b: float = 0.10,
+    min_red: float = 0.30,
+    min_saturation: float = 0.25,
+    min_value: float = 0.25,
+) -> np.ndarray:
+    """
+    Color-threshold fruit mask specifically tuned for red apples.
+
+    Args:
+        rgb_u8: Input image as uint8 (H, W, 3).
+    Returns:
+        Boolean mask (H, W).
+    """
+    rgb = rgb_u8.astype(np.float32) / 255.0
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    V = np.max(rgb, axis=-1)
+    Min = np.min(rgb, axis=-1)
+    S = (V - Min) / (V + 1e-6)
+
+    is_red = (R > G + red_margin_g) & (R > B + red_margin_b) & (R > min_red)
+    is_sat = S > min_saturation
+    is_bright = V > min_value
+    return is_red & is_sat & is_bright
+
+def cube_fruit_stats(cube: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
+    """
+    Compute statistics over the masked (fruit) pixels of a cube.
+
+    Args:
+        cube: HSI cube (H, W, 31).
+        mask: Boolean mask (H, W).
+    Returns:
+        Dictionary containing n_pixels, mean, max, std, and per-band stats.
+    """
+    if mask.shape[:2] != cube.shape[:2]:
+        raise ValueError(f"mask shape {mask.shape} does not match cube spatial shape {cube.shape[:2]}")
+    if not mask.any():
+        return {
+            "n_pixels": 0,
+            "mean": float("nan"),
+            "max": float("nan"),
+            "std": float("nan"),
+            "band_means": np.zeros(cube.shape[2], dtype=np.float32),
+            "per_band_max": np.zeros(cube.shape[2], dtype=np.float32),
+            "per_band_std": np.zeros(cube.shape[2], dtype=np.float32),
+            "empty": True,
+        }
+    px = cube[mask]
+    return {
+        "n_pixels": int(mask.sum()),
+        "mean": float(px.mean()),
+        "max": float(px.max()),
+        "std": float(px.std()),
+        "band_means": px.mean(axis=0).astype(np.float32),
+        "per_band_max": px.max(axis=0).astype(np.float32),
+        "per_band_std": px.std(axis=0).astype(np.float32),
+        "empty": False,
+    }
+
+def snv(spectrum: np.ndarray) -> np.ndarray:
+    """Perform Standard Normal Variate (SNV) transformation."""
+    std = np.std(spectrum)
+    if std == 0: return spectrum
+    return (spectrum - np.mean(spectrum)) / std
+
+def apply_sg_derivative(spectrum: np.ndarray, window: int = 5, order: int = 2) -> np.ndarray:
+    """Compute the Savitzky-Golay 1st derivative of a spectrum."""
+    return savgol_filter(spectrum, window, order, deriv=1)
+
+def load_model2_ultra() -> Tuple[Any, Any]:
+    """
+    Load the Model 2 Ultra checkpoint (XGBoost + Scaler).
+
+    Returns:
+        Tuple of (XGBoost model, StandardScaler).
+    """
+    ckpt_path = PROJECT_DIR / "models" / "checkpoints" / "model2_ultra.pkl"
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"Model 2 Ultra checkpoint not found at {ckpt_path}")
+    return joblib.load(str(ckpt_path))
+
+def predict_pesticide(
+    cube: np.ndarray,
+    model_checkpoint: Dict[str, Any],
+    mask: Optional[np.ndarray] = None
+) -> Tuple[str, float]:
+    """
+    Predict pesticide residue class from a reconstructed HSI cube.
+
+    Args:
+        cube: Reconstructed HSI cube (H, W, 31).
+        model_checkpoint: Dict containing 'model' (XGBoost) and 'scaler' (StandardScaler).
+        mask: Optional boolean mask (H, W).
+    Returns:
+        Tuple of (predicted_label, confidence_score).
+    """
+    model = model_checkpoint["model"]
+    scaler = model_checkpoint["scaler"]
+
+    if mask is not None and mask.any():
+        px = cube[mask]
+        mean_spec = px.mean(axis=0)
+        std_spec = px.std(axis=0)
+    else:
+        mean_spec = cube.mean(axis=(0, 1))
+        std_spec = cube.std(axis=(0, 1))
+
+    snv_mean = snv(mean_spec)
+    sg_mean = apply_sg_derivative(snv_mean)
+
+    features = np.concatenate([mean_spec, snv_mean, sg_mean, std_spec])
+    features = features.reshape(1, -1)
+
+    features_scaled = scaler.transform(features)
+    pred_class = model.predict(features_scaled)[0]
+    probs = model.predict_proba(features_scaled)[0]
+
+    label_map = {0: "Fresh", 1: "Fungicide", 2: "Insecticide"}
+    return label_map[pred_class], float(probs[pred_class])
+
+def predict_pesticide_hybrid(
+    cube: np.ndarray,
+    rgb_u8: np.ndarray,
+    model_checkpoint: Dict[str, Any],
+    mask: Optional[np.ndarray] = None
+) -> Tuple[Dict[str, float], str, float]:
+    """
+    Predict pesticide residue using Hybrid features (RGB + HSI).
+
+    Args:
+        cube: Reconstructed HSI cube (H, W, 31).
+        rgb_u8: Original RGB image as uint8 (H, W, 3).
+        model_checkpoint: Dict containing 'model' and 'scaler'.
+        mask: Optional boolean mask (H, W).
+    Returns:
+        Tuple of (all_probabilities, top_label, top_confidence).
+    """
+    model = model_checkpoint["model"]
+    scaler = model_checkpoint["scaler"]
+
+    # 1. RGB Features (6 dims)
+    img_f = rgb_u8.astype(np.float32)
+    if mask is not None and mask.any():
+        rgb_pixels = img_f[mask]
+        rgb_mean = np.mean(rgb_pixels, axis=0)
+        rgb_std = np.std(rgb_pixels, axis=0)
+    else:
+        rgb_mean = np.mean(img_f, axis=(0, 1))
+        rgb_std = np.std(img_f, axis=(0, 1))
+    rgb_features = np.concatenate([rgb_mean, rgb_std])
+
+    # 2. HSI Features (124 dims)
+    if mask is not None and mask.any():
+        px = cube[mask]
+        mean_spec = px.mean(axis=0)
+        std_spec = px.std(axis=0)
+    else:
+        mean_spec = cube.mean(axis=(0, 1))
+        std_spec = cube.std(axis=(0, 1))
+
+    snv_mean = snv(mean_spec)
+    sg_mean = apply_sg_derivative(snv_mean)
+    hsi_features = np.concatenate([mean_spec, snv_mean, sg_mean, std_spec])
+
+    # 3. Combined Super-Vector (130 dims)
+    features = np.concatenate([rgb_features, hsi_features]).reshape(1, -1)
+
+    features_scaled = scaler.transform(features)
+    pred_class = model.predict(features_scaled)[0]
+    probs = model.predict_proba(features_scaled)[0]
+
+    label_map = {0: "Fresh", 1: "Fungicide", 2: "Insecticide"}
+    prob_map = {label_map[i]: float(probs[i]) for i in range(len(probs))}
+
+    return prob_map, label_map[pred_class], float(probs[pred_class])
+
+PIPELINE_TO_CHECKPOINT = {
+    "A":         PROJECT_DIR / "models/checkpoints/run_trained/net_best.pth",
+    "C":         PROJECT_DIR / "models/checkpoints/run_apple_spectrofood_finetuned/net_best.pth",
+    "fallback":  PROJECT_DIR / "models/checkpoints/run_trained/net_best.pth",
+}
+
+def resolve_checkpoint_for_pipeline(pipeline: str) -> Path:
+    """Map a pipeline name to a .pth path."""
+    if pipeline not in PIPELINE_TO_CHECKPOINT:
+        raise KeyError(f"Unknown pipeline {pipeline!r}")
+    p = PIPELINE_TO_CHECKPOINT[pipeline]
+    if not p.is_file():
+        raise FileNotFoundError(f"Pipeline {pipeline!r} -> checkpoint {p} does not exist.")
+    return p
+
+from routing import route_image, RoutingDecision  # noqa: E402
+
+def route_and_infer(
+    image_path: Union[str, Path],
+    *,
+    model: Optional[nn.Module] = None,
+    device: Union[torch.device, str, None] = None,
+    skip_inference: bool = False,
+) -> Tuple[RoutingDecision, Optional[np.ndarray]]:
+    """
+    Run the routing gate, then (if appropriate) run Model 1.
+
+    Args:
+        image_path: Path to the input RGB photo.
+        model: Optional pre-loaded MST++ model.
+        device: Device for inference.
+        skip_inference: If True, only perform routing.
+    Returns:
+        Tuple of (RoutingDecision, reconstructed_cube_or_None).
+    """
+    decision = route_image(image_path)
+
+    if decision.tier == 3 or decision.pipeline_to_run is None or skip_inference:
+        return decision, None
+
+    ckpt = resolve_checkpoint_for_pipeline(decision.pipeline_to_run)
+
+    if model is None or device is None:
+        loaded_model, loaded_device = load_model(ckpt, device)
+        model = model or loaded_model
+        device = device or loaded_device
+
+    cube = run_model1(image_path, model, device)
+    return decision, cube
+
+# ---------------------------------------------------------------------
+# Agro-HSR test-set helpers
+# ---------------------------------------------------------------------
+_TEST_LAYOUTS: Tuple[Tuple[Path, Path], ...] = (
+    (PROJECT_DIR / "data" / "raw" / "Test_RGB",
+     PROJECT_DIR / "data" / "raw" / "Test_Spec"),
+    (PROJECT_DIR / "data" / "raw" / "Agro-HSR" / "Test_RGB",
+     PROJECT_DIR / "data" / "raw" / "Agro-HSR" / "Test_Spec"),
+)
+
+def _resolve_test_dirs() -> Optional[Tuple[Path, Path]]:
+    """Return (Test_RGB, Test_Spec) for the first layout that exists on disk."""
+    for rgb, spec in _TEST_LAYOUTS:
+        if rgb.is_dir() and spec.is_dir():
+            return rgb, spec
+    return None
+
+_resolved = _resolve_test_dirs()
+TEST_RGB_DIR = _resolved[0] if _resolved else _TEST_LAYOUTS[0][0]
+TEST_SPEC_DIR = _resolved[1] if _resolved else _TEST_LAYOUTS[0][1]
+
+def list_test_pairs() -> List[str]:
+    """Return sorted stems of Agro-HSR test images that have BOTH a .jpg and .mat."""
+    if not TEST_RGB_DIR.is_dir() or not TEST_SPEC_DIR.is_dir():
+        return []
+    stems: List[str] = []
+    for jpg in sorted(glob.glob(str(TEST_RGB_DIR / "*.jpg"))):
+        stem = Path(jpg).stem
+        if (TEST_SPEC_DIR / f"{stem}.mat").is_file():
+            stems.append(stem)
+    return stems
+
+def load_ground_truth_hsi(stem: str) -> np.ndarray:
+    """Load the real 31-band HSI cube for a given Agro-HSR test stem."""
+    import hdf5storage
+    mat_path = TEST_SPEC_DIR / f"{stem}.mat"
+    if not mat_path.is_file():
+        raise FileNotFoundError(f"No ground-truth .mat at {mat_path}")
+    mat = hdf5storage.loadmat(str(mat_path))
+    if "cube" not in mat:
+        raise KeyError(f"Expected key 'cube' in {mat_path}")
+    return mat["cube"].astype(np.float32)
+
+def crop_to_match(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+    """Center-crop the ground-truth cube to the predicted cube's spatial size."""
+    h_g, w_g = gt.shape[:2]
+    h_p, w_p = pred.shape[:2]
+    if (h_g, w_g) == (h_p, w_p):
+        return gt
+    top = max(0, (h_g - h_p) // 2)
+    left = max(0, (w_g - w_p) // 2)
+    return gt[top:top + h_p, left:left + w_p, :]
+
+def compute_metrics(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    eps: float = 1e-3,
+) -> Dict[str, float]:
+    """Compute MRAE, RMSE, and PSNR between a predicted and ground-truth HSI."""
+    p = pred.astype(np.float32)
+    g = gt.astype(np.float32)
+    if p.shape != g.shape:
+        raise ValueError(f"Shape mismatch: pred {p.shape} vs gt {g.shape}")
+
+    diff = p - g
+    abs_diff = np.abs(diff)
+    mrae = float(np.mean(abs_diff / (np.abs(g) + eps)))
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+
+    p_lo, p_hi = float(p.min()), float(p.max())
+    if p_hi - p_lo < 1e-8:
+        psnr = 0.0
+    else:
+        p_rescaled = (p - p_lo) / (p_hi - p_lo)
+        g_rescaled = np.clip(g, 0.0, 1.0)
+        mse = float(np.mean((p_rescaled - g_rescaled) ** 2))
+        psnr = float(10.0 * np.log10(1.0 / mse)) if mse > 0 else 100.0
+
+    return {"mrae": mrae, "rmse": rmse, "psnr": psnr}
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--rgb", required=True)
+    p.add_argument("--ckpt", default=str(DEFAULT_CHECKPOINT))
+    p.add_argument("--out", default="output_cube.npy")
+    args = p.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, device = load_model(args.ckpt, device)
+    cube = run_model1(args.rgb, model, device)
+    np.save(args.out, cube)

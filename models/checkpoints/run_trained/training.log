@@ -1,0 +1,35 @@
+2026-08-13 11:59:48 - ======================================================================
+2026-08-13 11:59:48 - PATCHED train.py — SmartSpectra
+2026-08-13 11:59:48 -   Loss_MRAE_custom (guarded) + lambda_smooth=0.02 * Loss_Smoothness + lambda_spectral=0.02 * Loss_SpectralSmoothness + lambda_nonneg=0.02 * Loss_NonNeg  ||  patience=10  min_delta=0.0001
+2026-08-13 11:59:48 - CLI args: {'method': 'mst_plus_plus', 'pretrained_model_path': '/kaggle/working/train_code/model_zoo/mst_plus_plus.pth', 'batch_size': 10, 'end_epoch': 30, 'init_lr': 0.0004, 'outf': '/kaggle/working/exp/smartspectra_v2/2026_08_13_11_59_47', 'data_root': '/kaggle/working/agro_hsr_work', 'patch_size': 128, 'stride': 8, 'gpu_id': '0', 'use_l1': True, 'lambda_smooth': 0.02, 'lambda_spectral': 0.02, 'lambda_nonneg': 0.02, 'patience': 10, 'min_delta': 0.0001}
+2026-08-13 11:59:48 - ======================================================================
+2026-08-13 12:15:27 -  Iter[001000], Epoch[000001], learning rate : 0.000398909, Train Loss: 0.020459788, Test MRAE: 0.021780392, Test RMSE: 0.044890780, Test PSNR: 27.483945847 
+2026-08-13 12:31:00 -  Iter[002000], Epoch[000002], learning rate : 0.000395645, Train Loss: 0.015756063, Test MRAE: 0.020641455, Test RMSE: 0.042591546, Test PSNR: 27.919902802 
+2026-08-13 12:46:32 -  Iter[003000], Epoch[000003], learning rate : 0.000390242, Train Loss: 0.013619848, Test MRAE: 0.017540772, Test RMSE: 0.036306102, Test PSNR: 29.198389053 
+2026-08-13 13:02:03 -  Iter[004000], Epoch[000004], learning rate : 0.000382761, Train Loss: 0.012359663, Test MRAE: 0.015971303, Test RMSE: 0.034624044, Test PSNR: 29.490041733 
+2026-08-13 13:17:36 -  Iter[005000], Epoch[000005], learning rate : 0.000373283, Train Loss: 0.011551511, Test MRAE: 0.015170659, Test RMSE: 0.033428572, Test PSNR: 29.873003006 
+2026-08-13 13:33:09 -  Iter[006000], Epoch[000006], learning rate : 0.000361911, Train Loss: 0.010936640, Test MRAE: 0.015440907, Test RMSE: 0.033672523, Test PSNR: 29.852622986 
+2026-08-13 13:48:41 -  Iter[007000], Epoch[000007], learning rate : 0.000348771, Train Loss: 0.010467583, Test MRAE: 0.015406135, Test RMSE: 0.033384293, Test PSNR: 29.958820343 
+2026-08-13 14:04:12 -  Iter[008000], Epoch[000008], learning rate : 0.000334007, Train Loss: 0.010103459, Test MRAE: 0.016304858, Test RMSE: 0.034028228, Test PSNR: 29.759666443 
+2026-08-13 14:19:44 -  Iter[009000], Epoch[000009], learning rate : 0.000317780, Train Loss: 0.009778006, Test MRAE: 0.014213662, Test RMSE: 0.031678513, Test PSNR: 30.335765839 
+2026-08-13 14:35:14 -  Iter[010000], Epoch[000010], learning rate : 0.000300268, Train Loss: 0.009506728, Test MRAE: 0.014141082, Test RMSE: 0.030372955, Test PSNR: 30.660612106 
+2026-08-13 14:50:46 -  Iter[011000], Epoch[000011], learning rate : 0.000281663, Train Loss: 0.009272557, Test MRAE: 0.015393815, Test RMSE: 0.032551385, Test PSNR: 30.114618301 
+2026-08-13 15:06:18 -  Iter[012000], Epoch[000012], learning rate : 0.000262169, Train Loss: 0.009052674, Test MRAE: 0.013175625, Test RMSE: 0.029625718, Test PSNR: 30.912675858 
+2026-08-13 15:21:53 -  Iter[013000], Epoch[000013], learning rate : 0.000241999, Train Loss: 0.008857869, Test MRAE: 0.013078507, Test RMSE: 0.029438211, Test PSNR: 30.973550797 
+2026-08-13 15:37:25 -  Iter[014000], Epoch[000014], learning rate : 0.000221374, Train Loss: 0.008676721, Test MRAE: 0.012688573, Test RMSE: 0.028527066, Test PSNR: 31.232763290 
+2026-08-13 15:52:57 -  Iter[015000], Epoch[000015], learning rate : 0.000200521, Train Loss: 0.008511065, Test MRAE: 0.013174878, Test RMSE: 0.029048804, Test PSNR: 31.071804047 
+2026-08-13 16:08:29 -  Iter[016000], Epoch[000016], learning rate : 0.000179667, Train Loss: 0.008363461, Test MRAE: 0.014200854, Test RMSE: 0.030936217, Test PSNR: 30.593355179 
+2026-08-13 16:24:01 -  Iter[017000], Epoch[000017], learning rate : 0.000159042, Train Loss: 0.008222792, Test MRAE: 0.012846522, Test RMSE: 0.029583331, Test PSNR: 30.966766357 
+2026-08-13 16:39:31 -  Iter[018000], Epoch[000018], learning rate : 0.000138871, Train Loss: 0.008083764, Test MRAE: 0.012229653, Test RMSE: 0.028002180, Test PSNR: 31.419475555 
+2026-08-13 16:55:02 -  Iter[019000], Epoch[000019], learning rate : 0.000119375, Train Loss: 0.007951138, Test MRAE: 0.012379093, Test RMSE: 0.028391169, Test PSNR: 31.327268600 
+2026-08-13 17:10:33 -  Iter[020000], Epoch[000020], learning rate : 0.000100768, Train Loss: 0.007831677, Test MRAE: 0.011982404, Test RMSE: 0.027561808, Test PSNR: 31.527660370 
+2026-08-13 17:26:04 -  Iter[021000], Epoch[000021], learning rate : 0.000083254, Train Loss: 0.007720810, Test MRAE: 0.012801201, Test RMSE: 0.028794115, Test PSNR: 31.154409409 
+2026-08-13 17:41:35 -  Iter[022000], Epoch[000022], learning rate : 0.000067024, Train Loss: 0.007612335, Test MRAE: 0.012143095, Test RMSE: 0.028150821, Test PSNR: 31.373323441 
+2026-08-13 17:57:07 -  Iter[023000], Epoch[000023], learning rate : 0.000052257, Train Loss: 0.007512003, Test MRAE: 0.012059837, Test RMSE: 0.027699001, Test PSNR: 31.471092224 
+2026-08-13 18:12:38 -  Iter[024000], Epoch[000024], learning rate : 0.000039113, Train Loss: 0.007416370, Test MRAE: 0.012324179, Test RMSE: 0.028233437, Test PSNR: 31.352783203 
+2026-08-13 18:28:09 -  Iter[025000], Epoch[000025], learning rate : 0.000027738, Train Loss: 0.007326527, Test MRAE: 0.011983437, Test RMSE: 0.027917109, Test PSNR: 31.437356949 
+2026-08-13 18:43:39 -  Iter[026000], Epoch[000026], learning rate : 0.000018256, Train Loss: 0.007237621, Test MRAE: 0.012081566, Test RMSE: 0.027961202, Test PSNR: 31.432842255 
+2026-08-13 18:59:11 -  Iter[027000], Epoch[000027], learning rate : 0.000010771, Train Loss: 0.007155664, Test MRAE: 0.011994163, Test RMSE: 0.027889520, Test PSNR: 31.462268829 
+2026-08-13 19:14:42 -  Iter[028000], Epoch[000028], learning rate : 0.000005364, Train Loss: 0.007077783, Test MRAE: 0.012056069, Test RMSE: 0.027989021, Test PSNR: 31.423454285 
+2026-08-13 19:30:14 -  Iter[029000], Epoch[000029], learning rate : 0.000002095, Train Loss: 0.007003092, Test MRAE: 0.012006395, Test RMSE: 0.027880706, Test PSNR: 31.460193634 
+2026-08-13 19:45:46 - EARLY STOP at iter=30000, best MRAE=0.011982

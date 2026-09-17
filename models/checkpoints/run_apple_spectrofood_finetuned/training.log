@@ -1,0 +1,28 @@
+{
+  "epochs": 3,
+  "init_lr": 3e-05,
+  "batch": 4,
+  "crop": 128,
+  "stride": 64,
+  "device": "cuda",
+  "data_root": "/kaggle/working/apple_pairs",
+  "training_data": "SpectroFood apple (240 cubes)",
+  "best_loss": 0.016870173510095034,
+  "log": [
+    {
+      "epoch": 1,
+      "loss": 0.027117373868478116,
+      "secs": 136.19568133354187
+    },
+    {
+      "epoch": 2,
+      "loss": 0.018209642521968043,
+      "secs": 136.53087902069092
+    },
+    {
+      "epoch": 3,
+      "loss": 0.016870173510095034,
+      "secs": 136.55536794662476
+    }
+  ]
+}

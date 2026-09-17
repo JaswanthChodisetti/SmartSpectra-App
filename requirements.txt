@@ -1,0 +1,10 @@
+streamlit
+torch
+torchvision
+numpy
+pandas
+joblib
+opencv-python-headless
+matplotlib
+seaborn
+shap

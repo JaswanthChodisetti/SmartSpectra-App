@@ -1,0 +1,164 @@
+import os
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+import joblib
+import torch
+import sys
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.utils.class_weight import compute_sample_weight
+
+# Path Setup
+ROOT = Path(__file__).resolve().parent.parent
+MODEL1_CKPT = ROOT / "models/checkpoints/run_trained/net_best.pth"
+BASE_MANIFEST = ROOT / "Archive/experiments/clean_apple_pesticide_manifest.csv"
+SAVE_PATH = ROOT / "models/checkpoints/model2_balanced_boost_v2.pkl"
+
+# Import from demo
+import sys
+sys.path.insert(0, str(ROOT / "demo"))
+from inference import run_model1, load_model, snv, apply_sg_derivative, segment_produce, compute_spectral_ratios
+
+def extract_pure_science_features(image_path, model1, device):
+    import cv2
+    img_bgr_orig = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img_bgr_orig is None: return None
+    img_bgr = cv2.resize(img_bgr_orig, (256, 256), interpolation=cv2.INTER_AREA)
+    try:
+        with torch.no_grad():
+            cube = run_model1(image_path, model1, device)
+    except Exception: return None
+    mask = segment_produce(img_bgr)
+    if mask.any():
+        px = cube[mask]
+        mean_spec, std_spec = px.mean(axis=0), px.std(axis=0)
+    else:
+        mean_spec, std_spec = cube.mean(axis=(0, 1)), cube.std(axis=(0, 1))
+
+    snv_mean = snv(mean_spec)
+    sg_mean = apply_sg_derivative(snv_mean)
+    ratio_features = compute_spectral_ratios(mean_spec)
+    return np.concatenate([np.concatenate([snv_mean, sg_mean, std_spec]), ratio_features])
+
+def augment_spectral_shift(features, n_variants=5):
+    """
+    Simulate spectral shifts (variety/ripeness changes) by shifting the
+    baseline of the spectral curve slightly.
+    """
+    variants = []
+    for _ in range(n_variants):
+        # Shift the entire spectrum by a small random offset
+        shift = np.random.uniform(-0.002, 0.002, size=features.shape)
+        variants.append(features + shift)
+    return np.array(variants)
+
+def train_balanced_boost_v2():
+    print("--- BALANCED DIVERSIFICATION v2 (STRICT MONITORING) ---")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load MST++
+    model1, _ = load_model(str(MODEL1_CKPT), device)
+
+    # 2. Load Data
+    if not BASE_MANIFEST.exists():
+        print(f"Error: Manifest not found at {BASE_MANIFEST}")
+        return
+    df = pd.read_csv(BASE_MANIFEST)
+
+    X, y = [], []
+    label_map = {"Fresh": 0, "Pesticide": 1}
+
+    print("Extracting features...")
+    for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df))):
+        feat = extract_pure_science_features(row["path"], model1, device)
+        if feat is None: continue
+        X.append(feat)
+        y.append(label_map.get(row["label"], 0))
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # 3. Proportional Augmentation (1:1 Rule)
+    print("Applying Spectral Shift Augmentation...")
+    X_aug, y_aug = [], []
+    for label in [0, 1]:
+        mask = (y == label)
+        class_features = X[mask]
+        class_labels = y[mask]
+
+        X_aug.extend(class_features)
+        y_aug.extend(class_labels)
+
+        for feat in class_features:
+            variants = augment_spectral_shift(feat, n_variants=5)
+            X_aug.extend(variants)
+            y_aug.extend([label] * 5)
+
+    X_all = np.array(X_aug)
+    y_all = np.array(y_aug)
+    print(f"Total augmented samples: {len(X_all)}")
+
+    # 4. Split
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X_all, y_all, test_size=0.15, random_state=42, stratify=y_all
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=0.176, random_state=42, stratify=y_train_val
+    )
+
+    # 5. Scaling
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    X_test_scaled = scaler.transform(X_test)
+
+    # 6. Moderate Weighting: 2.0x for Fresh
+    base_weights = compute_sample_weight('balanced', y_train)
+    final_weights = np.where(y_train == 0, base_weights * 2.0, base_weights)
+
+    # 7. Model - Strict Guardrails (max_depth=2)
+    model = xgb.XGBClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=2,           # Locked
+        gamma=0.8,
+        reg_alpha=0.2,
+        reg_lambda=1.2,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric='logloss',
+        early_stopping_rounds=20
+    )
+
+    # To monitor during training, we use the eval_set
+    model.fit(X_train_scaled, y_train, sample_weight=final_weights, eval_set=[(X_val_scaled, y_val)], verbose=True)
+
+    # 8. Final Safety Evaluation
+    test_preds = model.predict(X_test_scaled)
+    acc = accuracy_score(y_test, test_preds)
+    cm = confusion_matrix(y_test, test_preds)
+    pest_recall = cm[1][1] / (cm[1][1] + cm[1][0]) if (cm[1][1] + cm[1][0]) > 0 else 0
+
+    print("\n" + "="*40)
+    print("FINAL SAFE-BALANCE RESULTS")
+    print("="*40)
+    print(f"Overall Accuracy: {acc:.2%}")
+    print(f"Pesticide Recall (Safety): {pest_recall:.2%}")
+    print("\nClassification Report:\n", classification_report(y_test, test_preds))
+    print("Confusion Matrix:\n", cm)
+    print("="*40)
+
+    if acc > 0.80 and pest_recall > 0.80:
+        SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"model_s1": model, "scaler": scaler}, SAVE_PATH)
+        print(f"\nSuccess! Model saved to {SAVE_PATH}")
+    else:
+        print("\nWarning: Safety threshold not met. Not saving.")
+
+if __name__ == "__main__":
+    train_balanced_boost_v2()
