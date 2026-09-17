@@ -9,23 +9,26 @@ import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------
-# MODULE ALIASING (Pickle Fix)
+# MODULE ALIASING & PATH FIX (Pickle Fix)
 # ---------------------------------------------------------------------
-# This block prevents ModuleNotFoundError when loading the XGBoost model (.pkl)
-# which was pickled under the name 'scripts.train_ultimate_mlp'.
+# This block prevents ModuleNotFoundError when loading the XGBoost model (.pkl).
+# The pickle expects the 'SpectralMLP' class to be in 'scripts.train_ultimate_mlp'.
 try:
-    # Resolve the project root and demo directory
+    # 1. Resolve absolute paths
     _app_path = Path(__file__).resolve()
     _demo_dir = _app_path.parent
     _root_dir = _demo_dir.parent
 
+    # 2. Add both root and demo dir to sys.path to ensure all modules are discoverable
+    if str(_root_dir) not in sys.path:
+        sys.path.insert(0, str(_root_dir))
     if str(_demo_dir) not in sys.path:
         sys.path.insert(0, str(_demo_dir))
 
-    # Import the module that contains the SpectralMLP class
+    # 3. Now we can safely import the module containing the class
     import inference as _inf_mod
 
-    # Alias all possible names the pickle might look for
+    # 4. Alias every possible name the pickle might look for to the current inference module
     _alias_targets = [
         "scripts.train_ultimate_mlp",
         "train_ultimate_mlp",
@@ -35,12 +38,9 @@ try:
     for target in _alias_targets:
         sys.modules[target] = _inf_mod
 
-except Exception as e:
-    # We fail silently here to avoid crashing the app on startup if the
-    # environment is weird, but the error will surface during model load.
+except Exception:
     pass
 
-import json
 import json
 from datetime import datetime
 import tempfile
