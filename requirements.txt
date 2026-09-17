@@ -10,3 +10,4 @@ seaborn
 shap
 einops
 open_clip_torch
+timm
