@@ -4,6 +4,18 @@ Design System: 'Deep Obsidian' (Black, Glass, Neon Emerald).
 """
 from __future__ import annotations
 
+import sys
+# Fix for Pickle Deserialization Error: Redirect original training module to current inference module
+try:
+    import inference as inference_mod
+    sys.modules["scripts.train_ultimate_mlp"] = inference_mod
+except ImportError:
+    try:
+        import demo.inference as inference_mod
+        sys.modules["scripts.train_ultimate_mlp"] = inference_mod
+    except ImportError:
+        pass
+
 import os
 import json
 from datetime import datetime
