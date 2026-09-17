@@ -9,3 +9,4 @@ matplotlib
 seaborn
 shap
 einops
+open_clip_torch
