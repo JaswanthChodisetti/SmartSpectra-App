@@ -8,3 +8,4 @@ opencv-python-headless
 matplotlib
 seaborn
 shap
+einops
