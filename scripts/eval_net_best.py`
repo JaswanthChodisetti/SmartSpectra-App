@@ -1,0 +1,117 @@
+import torch
+import joblib
+import cv2
+import numpy as np
+import json
+from pathlib import Path
+from tqdm import tqdm
+import sys
+
+# Path Setup
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = Path(r"C:\Users\jaswa\Downloads\net_best.pth")
+MANIFEST_PATH = ROOT / "data/pesticides/vaishnavi_2023/apple_pairs_extended_blind.json"
+
+# Import necessary functions from the existing project
+sys.path.insert(0, str(ROOT))
+try:
+    from demo.inference import load_model, run_model1, segment_produce
+except ImportError:
+    # Fallback if paths are different
+    from inference import load_model, run_model1, segment_produce
+
+def compute_metrics(pred, gt, eps=1e-3):
+    p = pred.astype(np.float32)
+    g = gt.astype(np.float32)
+    diff = p - g
+    abs_diff = np.abs(diff)
+    mrae = float(np.mean(abs_diff / (np.abs(g) + eps)))
+    rmse = float(np.sqrt(np.mean(diff ** 2)))
+
+    p_lo, p_hi = float(p.min()), float(p.max())
+    if p_hi - p_lo < 1e-8:
+        psnr = 0.0
+    else:
+        p_rescaled = (p - p_lo) / (p_hi - p_lo)
+        g_rescaled = np.clip(g, 0.0, 1.0)
+        mse = float(np.mean((p_rescaled - g_rescaled) ** 2))
+        psnr = float(10.0 * np.log10(1.0 / mse)) if mse > 0 else 100.0
+    return mrae, rmse, psnr
+
+def main():
+    if not MODEL_PATH.exists():
+        print(f"Error: Model not found at {MODEL_PATH}")
+        return
+    if not MANIFEST_PATH.exists():
+        print(f"Error: Manifest not found at {MANIFEST_PATH}")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Loading model from {MODEL_PATH} on {device}...")
+    model, device = load_model(str(MODEL_PATH), device)
+
+    with open(MANIFEST_PATH, "r") as f:
+        manifest = json.load(f)
+
+    pairs = manifest["pairs"]
+    all_mrae, all_rmse, all_psnr = [], [], []
+
+    print(f"Evaluating {len(pairs)} samples...")
+    for pair_id, info in tqdm(pairs.items()):
+        rgb_path = Path(info["rgb_path"])
+        # The manifest might have different paths, we try to find the matching .mat file
+        # Assuming the HSI cube is stored as .mat in the corresponding folder
+        hsi_path = Path(info["hsi_path"]) if "hsi_path" in info else None
+
+        if not rgb_path.exists():
+            continue
+
+        try:
+            # 1. Predict cube
+            cube_pred = run_model1(str(rgb_path), model, device)
+
+            # 2. Load Ground Truth
+            if hsi_path and hsi_path.exists():
+                import hdf5storage
+                mat = hdf5storage.loadmat(str(hsi_path))
+                cube_gt = mat["cube"].astype(np.float32)
+            else:
+                # Try to find .mat file by stem if hsi_path is missing
+                stem = rgb_path.stem
+                # Search for the .mat file in the data directory
+                # This is a simplification; in reality, we'd use the dataset structure
+                continue
+
+            # 3. Crop/Align if necessary
+            # Ensure shapes match
+            h_g, w_g, c_g = cube_gt.shape
+            h_p, w_p, c_p = cube_pred.shape
+
+            if (h_g, w_g) != (h_p, w_p):
+                # Center crop ground truth to match prediction
+                top = max(0, (h_g - h_p) // 2)
+                left = max(0, (w_g - w_p) // 2)
+                cube_gt = cube_gt[top:top+h_p, left:left+w_p, :]
+
+            mrae, rmse, psnr = compute_metrics(cube_pred, cube_gt)
+            all_mrae.append(mrae)
+            all_rmse.append(rmse)
+            all_psnr.append(psnr)
+
+        except Exception as e:
+            print(f"Error processing {pair_id}: {e}")
+
+    if not all_mrae:
+        print("No samples were successfully evaluated. Please check your HSI paths in the manifest.")
+        return
+
+    print("\n" + "="*40)
+    print(f"FINAL METRICS for {MODEL_PATH.name}")
+    print("="*40)
+    print(f"Average PSNR: {np.mean(all_psnr):.4f}")
+    print(f"Average MRAE: {np.mean(all_mrae):.4f}")
+    print(f"Average RMSE: {np.mean(all_rmse):.4f}")
+    print("="*40)
+
+if __name__ == "__main__":
+    main()

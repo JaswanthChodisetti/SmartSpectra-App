@@ -142,7 +142,8 @@ def main() -> None:
     p.add_argument("--stem", default="Train_1000",
                    help="File stem, e.g. Train_1000 or Test_42. Default: Train_1000.")
     p.add_argument("--data-root",
-                   default="/mnt/c/Users/jaswa/ollama/Smart_Spectra/data/raw/Agro-HSR/Train_Spec",
+                   default=os.path.join(ROOT, 'data', 'raw', 'Agro-HSR', 'Train_Spec'),
+
                    help="Directory containing <stem>.mat files. "
                         "Default: WSL path to the project's Agro-HSR Train_Spec/. "
                         "On native Windows, override with the corresponding "

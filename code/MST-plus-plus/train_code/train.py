@@ -66,11 +66,13 @@ parser.add_argument("--batch_size", type=int, default=20, help="batch size")
 parser.add_argument("--end_epoch", type=int, default=300, help="number of epochs")
 parser.add_argument("--init_lr", type=float, default=4e-4, help="initial learning rate")
 parser.add_argument("--outf", type=str,
-                    default='/mnt/c/Users/jaswa/ollama/Smart_Spectra/models/checkpoints/mst_plus_plus/',
+                    default=os.path.join(ROOT, 'models', 'checkpoints', 'mst_plus_plus'),
+
                     help='path log files. Default points at this project\'s models/checkpoints/ '
                          'so net_best.pth lands in a tracked location.')
 parser.add_argument("--data_root", type=str,
-                    default='/mnt/c/Users/jaswa/ollama/Smart_Spectra/data/raw/Agro-HSR/',
+                    default=os.path.join(ROOT, 'data', 'raw', 'Agro-HSR'),
+
                     help="Agro-HSR root. Default points at this project's layout.")
 parser.add_argument("--patch_size", type=int, default=128, help="patch size")
 parser.add_argument("--stride", type=int, default=8, help="stride")
