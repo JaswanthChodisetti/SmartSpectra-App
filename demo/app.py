@@ -36,11 +36,16 @@ try:
     _original_import = builtins.__import__
 
     def _smart_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # Redirect known legacy paths or patterns to our current inference module
-        legacy_patterns = ["train_ultimate_mlp", "scripts.train", "models.inference", "inference"]
-        if any(pat in name for pat in legacy_patterns):
+        # REDIRECT ONLY our specific project modules.
+        # Do NOT redirect standard libraries or third-party packages.
+        legacy_patterns = ["train_ultimate_mlp", "scripts.train", "models.inference", "demo.inference", "inference"]
+
+        # Only intercept if the module name specifically matches our project's internal naming
+        if any(name == pat or name.startswith("scripts.train") or name.startswith("models.inference") for pat in legacy_patterns):
             return _inf_mod
+
         return _original_import(name, globals, locals, fromlist, level)
+
 
     builtins.__import__ = _smart_import
 
