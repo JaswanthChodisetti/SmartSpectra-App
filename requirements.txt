@@ -12,3 +12,5 @@ shap
 hdf5storage
 tqdm
 streamlit
+einops
+open_clip_torch
