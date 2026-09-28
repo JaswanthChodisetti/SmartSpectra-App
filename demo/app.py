@@ -33,10 +33,14 @@ try:
         "scripts.train_ultimate_mlp",
         "train_ultimate_mlp",
         "demo.inference",
-        "inference"
+        "inference",
+        "scripts.inference",
+        "models.inference",
+        "train_ultimate_mlp.py"
     ]
     for target in _alias_targets:
         sys.modules[target] = _inf_mod
+
 
 except Exception:
     pass
