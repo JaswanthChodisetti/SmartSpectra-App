@@ -14,3 +14,4 @@ tqdm
 streamlit
 einops
 open_clip_torch
+xgboost
