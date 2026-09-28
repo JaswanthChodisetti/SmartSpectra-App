@@ -28,18 +28,31 @@ try:
     # 3. Now we can safely import the module containing the class
     import inference as _inf_mod
 
-    # 4. Alias every possible name the pickle might look for to the current inference module
+    # 4. Aggressive Dynamic Aliasing
+    # This intercepts ANY import request that looks like our old training scripts
+    # and redirects it to the current inference module to satisfy the pickle load.
+    import builtins
+
+    _original_import = builtins.__import__
+
+    def _smart_import(name, globals=None, locals=None, fromlist=(), level=0):
+        # Redirect known legacy paths or patterns to our current inference module
+        legacy_patterns = ["train_ultimate_mlp", "scripts.train", "models.inference", "inference"]
+        if any(pat in name for pat in legacy_patterns):
+            return _inf_mod
+        return _original_import(name, globals, locals, fromlist, level)
+
+    builtins.__import__ = _smart_import
+
+    # Also maintain the sys.modules cache for joblib/pickle
     _alias_targets = [
-        "scripts.train_ultimate_mlp",
-        "train_ultimate_mlp",
-        "demo.inference",
-        "inference",
-        "scripts.inference",
-        "models.inference",
-        "train_ultimate_mlp.py"
+        "scripts.train_ultimate_mlp", "train_ultimate_mlp",
+        "demo.inference", "inference", "scripts.inference",
+        "models.inference", "train_ultimate_mlp.py"
     ]
     for target in _alias_targets:
         sys.modules[target] = _inf_mod
+
 
 
 except Exception:
