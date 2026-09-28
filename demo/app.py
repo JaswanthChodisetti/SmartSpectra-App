@@ -36,12 +36,17 @@ try:
     _original_import = builtins.__import__
 
     def _smart_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # REDIRECT ONLY our specific project modules.
-        # Do NOT redirect standard libraries or third-party packages.
-        legacy_patterns = ["train_ultimate_mlp", "scripts.train", "models.inference", "demo.inference", "inference"]
+        # STRICT project-only interception.
+        # We only want to redirect modules that are explicitly part of our local codebase.
+        # Any import starting with 'sympy', 'torch', 'open_clip', or 'torchvision' must be ignored.
 
-        # Only intercept if the module name specifically matches our project's internal naming
-        if any(name == pat or name.startswith("scripts.train") or name.startswith("models.inference") for pat in legacy_patterns):
+        # 1. Immediately allow common large libraries to pass through without checking
+        if any(name.startswith(lib) for lib in ["sympy", "torch", "open_clip", "torchvision", "numpy", "pandas"]):
+            return _original_import(name, globals, locals, fromlist, level)
+
+        # 2. Redirect only specific local project aliases
+        legacy_patterns = ["train_ultimate_mlp", "scripts.train", "models.inference", "demo.inference", "inference"]
+        if name in legacy_patterns or name.startswith("scripts.train_") or name.startswith("models.inference"):
             return _inf_mod
 
         return _original_import(name, globals, locals, fromlist, level)
