@@ -43,6 +43,7 @@ from MST_Plus_Plus import MST_Plus_Plus
 # Model storage locations
 CKPT_DIR = BASE_DIR / "models" / "checkpoints"
 DEFAULT_MODEL_PATH = CKPT_DIR / "run_trained" / "net_best.pth"
+PINNED_DEFAULT_CKPT = DEFAULT_MODEL_PATH
 
 def _find_best_checkpoint(root: Path) -> Path | None:
     if not root.is_dir():

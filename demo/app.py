@@ -62,23 +62,17 @@ from inference import (
     DEFAULT_CHECKPOINT,
     PINNED_DEFAULT_CKPT,
     compute_metrics,
-    crop_to_match,
-    cube_fruit_stats,
-    enhance_for_display,
     list_test_pairs,
-    load_ground_truth_hsi,
     load_model,
-    resolve_checkpoint_for_pipeline,
     route_and_infer,
     run_model1,
-    segment_fruit,
     segment_produce,
-    load_model2_ultra,
     predict_pesticide,
     predict_pesticide_hybrid,
     get_regional_mean,
-    get_fresh_apple_baseline,
-    get_spectral_fingerprint,
+    get_baseline_spec,
+    get_shap_fingerprint,
+    enhance_cube,
 )
 
 # ---------------------------------------------------------------------
@@ -713,7 +707,7 @@ def main():
                 m2_hybrid = get_model2_hybrid()
                 mask = segment_produce(rgb_u8_256)
                 probs, label, conf, feat_scaled = predict_pesticide_hybrid(cube, rgb_u8_256, m2_hybrid, mask=mask)
-                fingerprint = get_spectral_fingerprint(feat_scaled, m2_hybrid)
+                fingerprint = get_shap_fingerprint(feat_scaled, m2_hybrid)
 
             with col_res:
                 st.markdown("<div style='margin-top: 60px;'></div>", unsafe_allow_html=True)
@@ -740,7 +734,7 @@ def main():
 
             st.markdown("<div style='margin-top: 64px;'></div>", unsafe_allow_html=True)
             with st.expander("🔬 Spectral Data Analysis", expanded=False):
-                cube_disp = enhance_for_display(cube)
+                cube_disp = enhance_cube(cube)
                 b_cols = st.columns(5)
                 for i, b_idx in enumerate([0, 7, 15, 23, 30]):
                     b_cols[i].image(cube_disp[:, :, b_idx], caption=f"{400+b_idx*20}nm", width='stretch', clamp=True)
@@ -756,7 +750,7 @@ def main():
                 h, w = cube_disp.shape[:2]
                 actual_spec = get_regional_mean(cube_disp, mask)
 
-                baseline = get_fresh_apple_baseline()
+                baseline = get_baseline_spec()
 
                 ax.plot(wavelengths, actual_spec, marker="o", markersize=3, color="#10B981", label="Sample Spectrum (Regional Mean)", linewidth=2)
                 if show_baseline:

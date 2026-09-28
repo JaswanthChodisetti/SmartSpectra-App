@@ -1,0 +1,41 @@
+{
+  "tier_reject_threshold": 0.20,
+  "log_top_k_prompts": 5,
+  "tiers": {
+    "tier_1": {
+      "prompts": [
+        "a photo of a red apple",
+        "a photo of a green apple",
+        "a photo of a yellow apple",
+        "a photo of a sweet potato"
+      ],
+      "pipelines": {
+        "apple": "C",
+        "sweet potato": "A"
+      }
+    },
+    "tier_2": {
+      "prompts": [
+        "a photo of a banana",
+        "a photo of a tomato",
+        "a photo of an orange",
+        "a photo of a pear"
+      ],
+      "default_pipeline": "fallback"
+    },
+    "tier_3": {
+      "prompts": [
+        "a photo of a table",
+        "a photo of a person",
+        "a photo of a room",
+        "a photo of a street"
+      ]
+    }
+  },
+  "tie_breaker": {
+    "enabled": false,
+    "cosine_threshold": 0.70,
+    "trigger_margin": 0.03,
+    "centroid_path": "apple_centroid.npy"
+  }
+}
